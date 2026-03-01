@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lightning Arena</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="bg-gradient"></div>
+    <div class="particles" id="particles"></div>
+    
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">⚡</span>
+                <span class="logo-text">Lightning Arena</span>
+            </div>
+            <nav class="nav">
+                <a href="#play" class="nav-link">Play</a>
+                <a href="#validate" class="nav-link">Validate</a>
+                <a href="#about" class="nav-link">About</a>
+            </nav>
+        </header>
+
+        <main class="main">
+            <!-- Hero Section -->
+            <section class="hero">
+                <div class="hero-content">
+                    <h1 class="hero-title">
+                        Battle Arena
+                        <span class="gradient-text">Powered by Bitcoin</span>
+                    </h1>
+                    <p class="hero-subtitle">
+                        Compete in SuperTuxKart battles. Win sats. Instant withdrawals via Lightning Network.
+                    </p>
+                    <div class="hero-stats">
+                        <div class="stat">
+                            <span class="stat-value" id="total-games">0</span>
+                            <span class="stat-label">Games Played</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-value" id="total-sats">0</span>
+                            <span class="stat-label">Sats Won</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-value" id="active-players">0</span>
+                            <span class="stat-label">Active Players</span>
+                        </div>
+                    </div>
+                    <div class="hero-actions">
+                        <button class="btn btn-primary" onclick="showDeposit()">
+                            <span>🎮 Start Playing</span>
+                        </button>
+                        <button class="btn btn-secondary" onclick="showValidate()">
+                            <span>🏆 Claim Victory</span>
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Deposit Section -->
+            <section id="play" class="section glass-card">
+                <h2 class="section-title">Start Playing</h2>
+                <p class="section-subtitle">Deposit sats to join the arena. Minimum: 1000 sats</p>
+                
+                <div class="deposit-form">
+                    <div class="input-group">
+                        <label>Lightning Address</label>
+                        <input type="text" id="ln-address" placeholder="your@wallet.com" class="input">
+                        <span class="input-hint">Used for automatic withdrawals</span>
+                    </div>
+                    
+                    <div class="input-group">
+                        <label>Amount (sats)</label>
+                        <div class="amount-selector">
+                            <button class="amount-btn" data-amount="1000">1K</button>
+                            <button class="amount-btn" data-amount="5000">5K</button>
+                            <button class="amount-btn active" data-amount="10000">10K</button>
+                            <button class="amount-btn" data-amount="50000">50K</button>
+                        </div>
+                        <input type="number" id="amount" value="10000" min="1000" class="input">
+                    </div>
+                    
+                    <button class="btn btn-primary btn-full" onclick="createDeposit()">
+                        <span>⚡ Generate Invoice</span>
+                    </button>
+                </div>
+                
+                <div id="invoice-result" class="result-box hidden">
+                    <h3>Scan to Pay</h3>
+                    <div class="qr-placeholder">
+                        <span class="qr-code">[QR CODE]</span>
+                    </div>
+                    <code id="invoice-text" class="invoice-string"></code>
+                    <button class="btn btn-copy" onclick="copyInvoice()">Copy</button>
+                </div>
+            </section>
+
+            <!-- Validate Section -->
+            <section id="validate" class="section glass-card">
+                <h2 class="section-title">Claim Your Victory</h2>
+                <p class="section-subtitle">Paste your lightning_victory.json file</p>
+                
+                <div class="validate-form">
+                    <textarea id="victory-json" class="textarea" placeholder='{
+  "winner": "YourName",
+  "sats": 2500,
+  "signature": "...",
+  ...
+}'></textarea>
+                    <button class="btn btn-primary btn-full" onclick="validateVictory()">
+                        <span>🔐 Validate & Withdraw</span>
+                    </button>
+                </div>
+                
+                <div id="validation-result" class="result-box hidden"></div>
+            </section>
+
+            <!-- Features Grid -->
+            <section class="features">
+                <div class="feature-card">
+                    <div class="feature-icon">⚡</div>
+                    <h3>Instant Payouts</h3>
+                    <p>Withdraw your winnings directly to your Lightning wallet. No delays.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🎮</div>
+                    <h3>P2P Battles</h3>
+                    <p>Compete against other players. Winner takes all. Skill-based economy.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔐</div>
+                    <h3>Secure & Fair</h3>
+                    <p>Cryptographically signed victories. Server-authoritative gameplay.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔄</div>
+                    <h3>Reconnect Anytime</h3>
+                    <p>7-day reconnect window. Your balance is preserved.</p>
+                </div>
+            </section>
+        </main>
+
+        <footer class="footer">
+            <p>Powered by ⚡ Lightning Network & SuperTuxKart</p>
+            <p class="footer-links">
+                <a href="https://github.com/supertuxkart/stk-code">GitHub</a> •
+                <a href="#" onclick="showDocs()">API Docs</a> •
+                <a href="#" onclick="showTerms()">Terms</a>
+            </p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
