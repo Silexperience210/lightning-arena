@@ -1,0 +1,23 @@
+# Ngrok configuration for Lightning Arena
+# Get your token: https://dashboard.ngrok.com/get-started/your-authtoken
+
+version: "2"
+authtoken: ${NGROK_AUTHTOKEN}
+
+# Web UI for monitoring
+web_addr: 0.0.0.0:4040
+
+# Tunnels
+tunnels:
+  # Main API + Frontend tunnel
+  lightning-arena:
+    addr: api:3001
+    proto: http
+    # Domain personnalisé (optionnel, nécessite un abonnement ngrok)
+    # domain: your-domain.ngrok.io
+    
+    # Compression
+    compression: true
+    
+    # Inspection
+    inspect: true

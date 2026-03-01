@@ -1,0 +1,96 @@
+# =====================================================
+# LIGHTNING ARENA with NGROK - Easy public deployment
+# Perfect for demos and testing without domain setup
+# =====================================================
+#
+# USAGE:
+#   1. Get ngrok token: https://dashboard.ngrok.com/get-started/your-authtoken
+#   2. export NGROK_AUTHTOKEN=your_token_here
+#   3. docker-compose -f docker-compose.ngrok.yml up -d
+#   4. Check logs: docker-compose logs ngrok
+#   5. Copy HTTPS URL and share!
+#
+# =====================================================
+
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: lightning-arena-api
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=lightning_arena
+      - DB_USER=lightning
+      - DB_PASSWORD=${DB_PASSWORD:-change_me}
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-generate_a_strong_secret}
+      - NWC_ENCRYPTION_KEY=${NWC_ENCRYPTION_KEY:-generate_32_byte_hex}
+      - LND_ENABLED=false
+      - FRONTEND_URL=https://lightning-arena-ngrok.io  # Will be updated by ngrok
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  # NGROK - Automatic HTTPS tunnel
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: lightning-arena-ngrok
+    command:
+      - "start"
+      - "--all"
+      - "--config"
+      - "/etc/ngrok.yml"
+    volumes:
+      - ./ngrok.yml:/etc/ngrok.yml
+    ports:
+      - "4040:4040"  # Ngrok web interface
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    depends_on:
+      - api
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  # PostgreSQL
+  postgres:
+    image: postgres:16-alpine
+    container_name: lightning-arena-db
+    environment:
+      - POSTGRES_DB=lightning_arena
+      - POSTGRES_USER=lightning
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-change_me}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: lightning-arena-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  lightning-arena:
+    driver: bridge
