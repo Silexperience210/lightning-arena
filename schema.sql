@@ -25,8 +25,7 @@ CREATE TABLE users (
     nwc_uri_encrypted TEXT,
     nwc_uri_iv VARCHAR(32),
     nwc_uri_auth_tag VARCHAR(32),
-    nwc_budget_sats INTEGER DEFAULT 100000, -- budget limit
-    nwc_budget_renewal VARCHAR(16) DEFAULT 'daily' CHECK (nwc_budget_renewal IN ('never', 'daily', 'weekly', 'monthly', 'yearly')),
+    nwc_budget_sats INTEGER DEFAULT 100000, -- display only, NWC manages natively
     nwc_expires_at TIMESTAMP,
     nwc_last_used TIMESTAMP,
     
