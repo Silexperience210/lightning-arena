@@ -11,8 +11,11 @@ class PaymentRouter extends EventEmitter {
   constructor(config) {
     super();
     this.db = config.db;
-    this.lnd = config.lnd; // LND gRPC client
+    this.lnd = config.lnd; // LND gRPC client (optional)
     this.redis = config.redis;
+    
+    // Check if LND is available
+    this.lndEnabled = config.lnd && process.env.LND_ENABLED !== 'false';
     
     // Encryption key for NWC URIs (must be 32 bytes)
     this.encryptionKey = Buffer.from(process.env.NWC_ENCRYPTION_KEY, 'hex');
@@ -277,6 +280,10 @@ class PaymentRouter extends EventEmitter {
   // =====================================================
   
   async executeHybridNWCToEscrow(transferId, fromUserId, toUserId, amount, description) {
+    if (!this.lndEnabled) {
+      throw new Error('Hybrid mode requires LND. Use NWC_P2P mode only or enable LND.');
+    }
+    
     const fromUser = await this.getUserWithDecryptedNWC(fromUserId);
     
     // Create invoice to server's LND node
@@ -324,6 +331,10 @@ class PaymentRouter extends EventEmitter {
   // =====================================================
   
   async executeHybridEscrowToNWC(transferId, fromUserId, toUserId, amount, description) {
+    if (!this.lndEnabled) {
+      throw new Error('Hybrid mode requires LND. Use NWC_P2P mode only or enable LND.');
+    }
+    
     const toUser = await this.getUserWithDecryptedNWC(toUserId);
     
     // Check escrow balance

@@ -70,11 +70,34 @@ Player A (Escrow) ──► server debits ──► pays Player B (NWC) via LND
 
 ## 🚀 Quick Start
 
+### Option A: NWC P2P Only (No LND required!)
+For instant wallet-to-wallet payments using Nostr Wallet Connect.
+
+```bash
+# 1. Clone
+git clone https://github.com/silexperience210/lightning-arena.git
+cd lightning-arena
+
+# 2. Configure (minimal)
+cp .env.example .env
+# Edit .env - only need JWT_SECRET, NWC_ENCRYPTION_KEY, DB_PASSWORD
+
+# 3. Start (NO LND needed!)
+docker-compose -f docker-compose.nwc-only.yml up -d
+
+# 4. Done! http://localhost:3000
+```
+
+**Requirements for players:** All players must have NWC-compatible wallets (Alby, BlueWallet, Blixt).
+
+### Option B: Full Hybrid Mode (LND required)
+For full escrow support and compatibility with all Lightning wallets.
+
 ### Prerequisites
 
 - Docker & Docker Compose
 - Node.js 18+ (for local dev)
-- LND node (testnet or mainnet)
+- LND node (testnet or mainnet) - ONLY for hybrid/escrow modes
 
 ### 1. Clone & Setup
 

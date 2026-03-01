@@ -1,0 +1,121 @@
+# =====================================================
+# LIGHTNING ARENA - Docker Compose (NWC P2P Only)
+# NO LND REQUIRED - Pure P2P Nostr Wallet Connect mode
+# =====================================================
+# 
+# LIMITATION: Only NWC P2P mode works
+# - Players must ALL have NWC-compatible wallets (Alby, BlueWallet, Blixt)
+# - No escrow deposits/withdrawals
+# - No hybrid mode
+# - Instant wallet-to-wallet payments only
+#
+# For full hybrid mode (with escrow), use docker-compose.yml instead
+# =====================================================
+
+version: '3.8'
+
+services:
+  # Main API Server (NO LND dependency)
+  api:
+    build: .
+    container_name: lightning-arena-api
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=lightning_arena
+      - DB_USER=lightning
+      - DB_PASSWORD=${DB_PASSWORD:-change_me}
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-generate_a_strong_secret}
+      - NWC_ENCRYPTION_KEY=${NWC_ENCRYPTION_KEY:-generate_32_byte_hex}
+      # NO LND - NWC P2P only mode
+      - LND_ENABLED=false
+      - PAYMENT_MODES_ENABLED=nwc_p2p
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend (React)
+  frontend:
+    build: ./frontend
+    container_name: lightning-arena-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:3001
+      - REACT_APP_NWC_ONLY_MODE=true
+    depends_on:
+      - api
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: lightning-arena-db
+    environment:
+      - POSTGRES_DB=lightning_arena
+      - POSTGRES_USER=lightning
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-change_me}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: lightning-arena-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy (optional)
+  nginx:
+    image: nginx:alpine
+    container_name: lightning-arena-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.nwc-only.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+      - frontend
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+    profiles:
+      - production
+
+# NO LND SERVICE!
+# NO WORKER SERVICE (no withdrawals to process)!
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  lightning-arena:
+    driver: bridge
