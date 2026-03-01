@@ -1,0 +1,92 @@
+# =====================================================
+# LIGHTNING ARENA with Cloudflare Tunnel - Alternative pro
+# Avantage: URL fixe gratuite, très stable, sécurisé
+# Inconvénient: Nécessite un compte Cloudflare (gratuit)
+# =====================================================
+#
+# SETUP:
+#   1. Créer compte: https://dash.cloudflare.com/sign-up
+#   2. Installer cloudflared localement une fois:
+#      Windows: choco install cloudflared
+#      Mac: brew install cloudflared
+#      Linux: curl -L ... | bash
+#   3. Login: cloudflared tunnel login
+#   4. Créer tunnel: cloudflared tunnel create lightning-arena
+#   5. Copier le token dans .env: CLOUDFLARE_TUNNEL_TOKEN=xxx
+#
+# USAGE:
+#   docker-compose -f docker-compose.cloudflare.yml up -d
+#
+# =====================================================
+
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: lightning-arena-api
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=lightning_arena
+      - DB_USER=lightning
+      - DB_PASSWORD=${DB_PASSWORD:-change_me}
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-generate_secret}
+      - NWC_ENCRYPTION_KEY=${NWC_ENCRYPTION_KEY:-generate_key}
+      - LND_ENABLED=false
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  # CLOUDFLARE TUNNEL - Pro et stable
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: lightning-arena-cloudflare
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - api
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: lightning-arena-db
+    environment:
+      - POSTGRES_DB=lightning_arena
+      - POSTGRES_USER=lightning
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-change_me}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: lightning-arena-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  lightning-arena:
+    driver: bridge

@@ -1,0 +1,81 @@
+# =====================================================
+# LIGHTNING ARENA with LocalTunnel - Alternative à ngrok
+# Avantage: Pas besoin de token/compte !
+# Inconvénient: URL aléatoire qui change à chaque redémarrage
+# =====================================================
+#
+# USAGE:
+#   docker-compose -f docker-compose.localtunnel.yml up -d
+#   docker-compose logs localtunnel (pour voir l'URL)
+#
+# =====================================================
+
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: lightning-arena-api
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=lightning_arena
+      - DB_USER=lightning
+      - DB_PASSWORD=${DB_PASSWORD:-change_me}
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-generate_secret}
+      - NWC_ENCRYPTION_KEY=${NWC_ENCRYPTION_KEY:-generate_key}
+      - LND_ENABLED=false
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  # LOCALTUNNEL - Pas de token nécessaire !
+  localtunnel:
+    image: efrecon/localtunnel
+    container_name: lightning-arena-tunnel
+    command: --local-host api --port 3001
+    depends_on:
+      - api
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: lightning-arena-db
+    environment:
+      - POSTGRES_DB=lightning_arena
+      - POSTGRES_USER=lightning
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-change_me}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: lightning-arena-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - lightning-arena
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  lightning-arena:
+    driver: bridge
