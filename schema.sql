@@ -25,15 +25,16 @@ CREATE TABLE users (
     nwc_uri_encrypted TEXT,
     nwc_uri_iv VARCHAR(32),
     nwc_uri_auth_tag VARCHAR(32),
-    nwc_budget_sats INTEGER DEFAULT 100000, -- display only, NWC manages natively
+    nwc_budget_sats BIGINT DEFAULT 100000, -- display only, NWC manages natively
     nwc_expires_at TIMESTAMP,
     nwc_last_used TIMESTAMP,
-    
+
     -- Escrow Mode fields
-    escrow_balance_sats INTEGER DEFAULT 0 CHECK (escrow_balance_sats >= 0),
-    escrow_locked_sats INTEGER DEFAULT 0 CHECK (escrow_locked_sats >= 0),
-    escrow_total_deposited INTEGER DEFAULT 0,
-    escrow_total_withdrawn INTEGER DEFAULT 0,
+    -- BIGINT: cumulative columns exceed INTEGER (2.1B) for active accounts over time
+    escrow_balance_sats    BIGINT DEFAULT 0 CHECK (escrow_balance_sats >= 0),
+    escrow_locked_sats     BIGINT DEFAULT 0 CHECK (escrow_locked_sats >= 0),
+    escrow_total_deposited BIGINT DEFAULT 0,
+    escrow_total_withdrawn BIGINT DEFAULT 0,
     
     -- Reputation & Security
     reputation_score INTEGER DEFAULT 100 CHECK (reputation_score >= 0 AND reputation_score <= 100),
@@ -68,11 +69,11 @@ CREATE TABLE games (
     game_mode VARCHAR(32) DEFAULT 'ffa', -- ffa, team, 1v1
     
     -- Economics
-    buy_in_sats INTEGER NOT NULL CHECK (buy_in_sats >= 1000),
-    max_players INTEGER NOT NULL DEFAULT 4,
+    buy_in_sats    BIGINT NOT NULL CHECK (buy_in_sats >= 1000),
+    max_players    INTEGER NOT NULL DEFAULT 4,
     server_fee_percent DECIMAL(4,2) DEFAULT 1.00, -- 1%
-    server_fee_sats INTEGER DEFAULT 0,
-    total_pot_sats INTEGER DEFAULT 0,
+    server_fee_sats BIGINT DEFAULT 0,
+    total_pot_sats  BIGINT DEFAULT 0,
     
     -- Host
     host_id UUID REFERENCES users(id),
@@ -105,9 +106,9 @@ CREATE TABLE game_participants (
     player_name VARCHAR(32),
     
     -- Economics tracking
-    initial_balance INTEGER NOT NULL,
-    final_balance INTEGER,
-    net_profit INTEGER GENERATED ALWAYS AS (COALESCE(final_balance, 0) - initial_balance) STORED,
+    initial_balance BIGINT NOT NULL,
+    final_balance   BIGINT,
+    net_profit      BIGINT GENERATED ALWAYS AS (COALESCE(final_balance, 0) - initial_balance) STORED,
     total_hits_given INTEGER DEFAULT 0,
     total_hits_taken INTEGER DEFAULT 0,
     total_damage_dealt INTEGER DEFAULT 0,
@@ -146,9 +147,9 @@ CREATE TABLE transfers (
     to_user_id UUID NOT NULL REFERENCES users(id),
     
     -- How much
-    amount_sats INTEGER NOT NULL CHECK (amount_sats > 0),
-    fee_sats INTEGER DEFAULT 0,
-    net_amount INTEGER GENERATED ALWAYS AS (amount_sats - fee_sats) STORED,
+    amount_sats BIGINT NOT NULL CHECK (amount_sats > 0),
+    fee_sats    BIGINT DEFAULT 0,
+    net_amount  BIGINT GENERATED ALWAYS AS (amount_sats - fee_sats) STORED,
     
     -- Why
     weapon_type VARCHAR(32), -- bowling, cake, swatter, bubblegum, banana, collision
@@ -211,8 +212,8 @@ CREATE TABLE deposits (
     user_id UUID NOT NULL REFERENCES users(id),
     game_id UUID REFERENCES games(id), -- NULL if general deposit
     
-    amount_sats INTEGER NOT NULL CHECK (amount_sats > 0),
-    
+    amount_sats BIGINT NOT NULL CHECK (amount_sats > 0),
+
     -- Lightning invoice
     payment_hash VARCHAR(255) UNIQUE NOT NULL,
     payment_request TEXT NOT NULL,
@@ -243,9 +244,9 @@ CREATE TABLE withdrawals (
     user_id UUID NOT NULL REFERENCES users(id),
     game_id UUID REFERENCES games(id), -- NULL if general withdrawal
     
-    amount_sats INTEGER NOT NULL CHECK (amount_sats > 0),
-    fee_sats INTEGER DEFAULT 0,
-    
+    amount_sats BIGINT NOT NULL CHECK (amount_sats > 0),
+    fee_sats    BIGINT DEFAULT 0,
+
     -- Destination
     destination_ln_address VARCHAR(255) NOT NULL,
     
@@ -353,10 +354,10 @@ CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
 
 -- Function to get user total balance (hybrid calculation)
 CREATE OR REPLACE FUNCTION get_user_total_balance(user_uuid UUID)
-RETURNS INTEGER AS $$
+RETURNS BIGINT AS $$
 DECLARE
-    escrow_bal INTEGER;
-    nwc_24h_bal INTEGER;
+    escrow_bal  BIGINT;
+    nwc_24h_bal BIGINT;
 BEGIN
     SELECT escrow_balance_sats INTO escrow_bal
     FROM users WHERE id = user_uuid;
