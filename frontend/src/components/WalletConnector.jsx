@@ -4,7 +4,8 @@
  * Supports both NWC (Alby/BlueWallet) and Escrow (WoS/Phoenix) modes
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import './WalletConnector.css';
 
 const WalletConnector = ({ apiBaseUrl, onWalletConnected, userToken }) => {
@@ -293,10 +294,18 @@ const EscrowDeposit = ({ lnAddress, apiBaseUrl, userToken, onDepositComplete }) 
   const [invoice, setInvoice] = useState(null);
   const [status, setStatus] = useState('input'); // input, pending, paid
   const [loading, setLoading] = useState(false);
+  // Ref to track the active polling timer — cleared on unmount to prevent memory leaks
+  const pollTimerRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    };
+  }, []);
 
   const createDeposit = async () => {
     setLoading(true);
-    
+
     try {
       const response = await fetch(`${apiBaseUrl}/api/wallet/deposit`, {
         method: 'POST',
@@ -306,12 +315,11 @@ const EscrowDeposit = ({ lnAddress, apiBaseUrl, userToken, onDepositComplete }) 
         },
         body: JSON.stringify({ amountSats: amount })
       });
-      
+
       const data = await response.json();
       setInvoice(data);
       setStatus('pending');
-      
-      // Start polling for payment
+
       pollPaymentStatus(data.paymentHash);
     } catch (err) {
       console.error('Deposit error:', err);
@@ -327,22 +335,22 @@ const EscrowDeposit = ({ lnAddress, apiBaseUrl, userToken, onDepositComplete }) 
           `${apiBaseUrl}/api/wallet/deposit/${paymentHash}`,
           { headers: { 'Authorization': `Bearer ${userToken}` } }
         );
-        
+
         const data = await response.json();
-        
+
         if (data.status === 'paid') {
           setStatus('paid');
           onDepositComplete({ amountSats: amount });
-          return;
+          return; // Stop polling — payment confirmed
         }
       } catch (err) {
         console.error('Status check error:', err);
       }
-      
-      // Poll again in 2 seconds
-      setTimeout(() => checkStatus(), 2000);
+
+      // Schedule next check — stored in ref so it can be cancelled on unmount
+      pollTimerRef.current = setTimeout(checkStatus, 2000);
     };
-    
+
     checkStatus();
   };
 
@@ -353,7 +361,14 @@ const EscrowDeposit = ({ lnAddress, apiBaseUrl, userToken, onDepositComplete }) 
         <h2>Scan to Deposit</h2>
         
         <div className="qr-container glass">
-          <QRCode value={invoice.invoice} size={200} />
+          <QRCodeSVG
+            value={invoice.invoice}
+            size={200}
+            level="M"
+            includeMargin
+            bgColor="#ffffff"
+            fgColor="#000000"
+          />
         </div>
         
         <div className="invoice-string">
@@ -426,22 +441,5 @@ const EscrowDeposit = ({ lnAddress, apiBaseUrl, userToken, onDepositComplete }) 
     </div>
   );
 };
-
-// Simple QR Code component (placeholder - use qrcode.react in production)
-const QRCode = ({ value, size }) => (
-  <div 
-    className="qr-placeholder"
-    style={{ width: size, height: size }}
-  >
-    <svg viewBox="0 0 100 100" width={size} height={size}>
-      <rect fill="white" width="100" height="100"/>
-      <rect fill="black" x="10" y="10" width="25" height="25"/>
-      <rect fill="black" x="65" y="10" width="25" height="25"/>
-      <rect fill="black" x="10" y="65" width="25" height="25"/>
-      <rect fill="black" x="40" y="40" width="20" height="20"/>
-      <text x="50" y="55" textAnchor="middle" fontSize="8">QR CODE</text>
-    </svg>
-  </div>
-);
 
 export default WalletConnector;

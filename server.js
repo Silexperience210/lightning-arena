@@ -747,6 +747,182 @@ app.post('/api/games/:roomCode/join', authenticate, async (req, res) => {
 });
 
 // =====================================================
+// GAME LIFECYCLE ROUTES
+// =====================================================
+
+// Start game (lobby → playing)
+app.post('/api/games/:gameId/start', authenticate, requireGameHost, async (req, res) => {
+  const { gameId } = req.params;
+
+  try {
+    const game = await db('games').where('id', gameId).first();
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+    if (game.status !== 'lobby') return res.status(400).json({ error: `Cannot start a game with status: ${game.status}` });
+
+    const participants = await db('game_participants')
+      .where({ game_id: gameId, status: 'active' })
+      .select('user_id');
+
+    if (participants.length < 2) {
+      return res.status(400).json({ error: 'At least 2 players are required to start' });
+    }
+
+    await db('games').where('id', gameId).update({
+      status: 'playing',
+      started_at: new Date()
+    });
+
+    io.to(`game:${gameId}`).emit('game:started', {
+      gameId,
+      playerCount: participants.length,
+      startedAt: new Date()
+    });
+
+    res.json({ success: true, status: 'playing', playerCount: participants.length });
+  } catch (err) {
+    console.error('Game start error:', err);
+    res.status(500).json({ error: 'Failed to start game' });
+  }
+});
+
+// End game — determine winner, collect server fee, distribute pot
+app.post('/api/games/:gameId/end', authenticate, requireGameHost, async (req, res) => {
+  const { gameId } = req.params;
+  const { winnerId } = req.body;
+
+  if (!winnerId) return res.status(400).json({ error: 'winnerId is required' });
+
+  try {
+    const game = await db('games').where('id', gameId).first();
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+    if (game.status !== 'playing') return res.status(400).json({ error: `Cannot end a game with status: ${game.status}` });
+
+    // Validate winner is an active participant
+    const winner = await db('game_participants')
+      .where({ game_id: gameId, user_id: winnerId, status: 'active' })
+      .first();
+
+    if (!winner) {
+      return res.status(400).json({ error: 'Winner must be an active participant in this game' });
+    }
+
+    // ── Fee calculation ──────────────────────────────────────────────────────
+    const serverFeeSats = Math.floor(game.total_pot_sats * game.server_fee_percent / 100);
+    const winnerPayoutSats = game.total_pot_sats - serverFeeSats;
+
+    // ── Atomic distribution ──────────────────────────────────────────────────
+    await db.transaction(async (trx) => {
+      // Credit winner
+      await trx('users')
+        .where('id', winnerId)
+        .increment('escrow_balance_sats', winnerPayoutSats);
+
+      // Mark winner participant
+      await trx('game_participants')
+        .where({ game_id: gameId, user_id: winnerId })
+        .update({ status: 'winner', final_balance: winnerPayoutSats, eliminated_at: null });
+
+      // Mark remaining active participants as eliminated
+      await trx('game_participants')
+        .where({ game_id: gameId, status: 'active' })
+        .whereNot('user_id', winnerId)
+        .update({ status: 'eliminated', final_balance: 0, eliminated_at: new Date() });
+
+      // Release locked buy-ins from escrow players (already unlocked on payout)
+      await trx('users')
+        .whereIn('id',
+          trx('game_participants')
+            .where({ game_id: gameId })
+            .whereNot('user_id', winnerId)
+            .where('status', 'eliminated')
+            .select('user_id')
+        )
+        .decrement('escrow_locked_sats', game.buy_in_sats);
+
+      // Update winner's locked sats
+      await trx('users')
+        .where('id', winnerId)
+        .decrement('escrow_locked_sats', game.buy_in_sats);
+
+      // Finalize game record
+      await trx('games').where('id', gameId).update({
+        status: 'finished',
+        finished_at: new Date(),
+        server_fee_sats: serverFeeSats
+      });
+
+      // Record server fee as a transfer (audit trail)
+      if (serverFeeSats > 0) {
+        await trx('transfers').insert({
+          game_id: gameId,
+          from_user_id: winnerId,
+          to_user_id: winnerId, // fee stays on server — tracked in games.server_fee_sats
+          amount_sats: serverFeeSats,
+          fee_sats: 0,
+          payment_mode: 'server_fee',
+          reason: `Server fee (${game.server_fee_percent}%) for game ${game.room_code}`,
+          status: 'completed',
+          created_at: new Date(),
+          completed_at: new Date(),
+          expires_at: new Date()
+        });
+      }
+    });
+
+    // ── Broadcast result ─────────────────────────────────────────────────────
+    io.to(`game:${gameId}`).emit('game:ended', {
+      gameId,
+      winnerId,
+      winnerPayout: winnerPayoutSats,
+      serverFee: serverFeeSats,
+      totalPot: game.total_pot_sats,
+      roomCode: game.room_code
+    });
+
+    res.json({
+      success: true,
+      winnerId,
+      winnerPayoutSats,
+      serverFeeSats,
+      totalPotSats: game.total_pot_sats
+    });
+  } catch (err) {
+    console.error('Game end error:', err);
+    res.status(500).json({ error: 'Failed to end game' });
+  }
+});
+
+// Get game state (participants + balances)
+app.get('/api/games/:gameId/state', authenticate, async (req, res) => {
+  const { gameId } = req.params;
+
+  try {
+    const [game, participants] = await Promise.all([
+      db('games').where('id', gameId).first(),
+      db('game_participants')
+        .join('users', 'users.id', 'game_participants.user_id')
+        .where('game_participants.game_id', gameId)
+        .select(
+          'game_participants.user_id',
+          'game_participants.player_name',
+          'game_participants.status',
+          'game_participants.initial_balance',
+          'game_participants.final_balance',
+          'game_participants.total_hits_given',
+          'game_participants.total_hits_taken',
+          'users.wallet_type'
+        )
+    ]);
+
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+
+    res.json({ game, participants });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to get game state' });
+  }
+});
+
+// =====================================================
 // PAYMENT ROUTES (The Core)
 // =====================================================
 
@@ -803,22 +979,78 @@ app.get('/api/payments/history', authenticate, async (req, res) => {
 // WEBSOCKET HANDLING
 // =====================================================
 
+// Tracks pending elimination timers keyed by userId.
+// Cleared when the player reconnects before the timeout.
+const disconnectTimers = new Map();
+
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
-  
-  // Authenticate socket
-  socket.on('auth', (token) => {
+
+  // ── Auth ───────────────────────────────────────────────────────────────────
+  // Called on first connect AND on reconnect. Handles both cases uniformly.
+  socket.on('auth', async (token) => {
     try {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       socket.userId = decoded.userId;
       socket.join(`user:${decoded.userId}`);
       socket.emit('auth:success', { userId: decoded.userId });
+
+      // ── Reconnection: cancel elimination timer ─────────────────────────
+      if (disconnectTimers.has(decoded.userId)) {
+        clearTimeout(disconnectTimers.get(decoded.userId));
+        disconnectTimers.delete(decoded.userId);
+        console.log(`[Socket] Reconnect timer cancelled for user ${decoded.userId}`);
+      }
+
+      // ── Reconnection: restore mid-game state ───────────────────────────
+      const disconnectedParticipant = await db('game_participants')
+        .join('games', 'games.id', 'game_participants.game_id')
+        .where('game_participants.user_id', decoded.userId)
+        .where('games.status', 'playing')
+        .where('game_participants.status', 'disconnected')
+        .select('game_participants.*', 'games.room_code')
+        .first();
+
+      if (disconnectedParticipant) {
+        const gameId = disconnectedParticipant.game_id;
+
+        await db('game_participants')
+          .where('id', disconnectedParticipant.id)
+          .update({
+            status: 'active',
+            reconnected_at: new Date(),
+            disconnect_count: db.raw('disconnect_count + 1')
+          });
+
+        socket.join(`game:${gameId}`);
+
+        // Send current game state to the reconnected player
+        const participants = await db('game_participants')
+          .join('users', 'users.id', 'game_participants.user_id')
+          .where('game_participants.game_id', gameId)
+          .select(
+            'game_participants.user_id',
+            'game_participants.player_name',
+            'game_participants.status',
+            'game_participants.initial_balance',
+            'users.wallet_type'
+          );
+
+        socket.emit('game:state_restored', { gameId, participants });
+
+        io.to(`game:${gameId}`).emit('player:reconnected', {
+          userId: decoded.userId,
+          gameId
+        });
+
+        console.log(`[Socket] User ${decoded.userId} restored to game ${gameId}`);
+      }
     } catch (err) {
       socket.emit('auth:error', { error: 'Invalid token' });
     }
   });
-  
-  // Join game room — requires authenticated socket + active participation
+
+  // ── Join game room ─────────────────────────────────────────────────────────
   socket.on('game:join', async (gameId) => {
     if (!socket.userId) {
       socket.emit('error', { message: 'Authentication required before joining a game room' });
@@ -841,25 +1073,22 @@ io.on('connection', (socket) => {
       console.error('game:join socket error:', err);
     }
   });
-  
-  // Handle game events
+
+  // ── Game hit ───────────────────────────────────────────────────────────────
   socket.on('game:hit', async (data) => {
     const { gameId, victimId, hitterId, weapon, damage } = data;
 
-    // Only the authenticated hitter can emit their own hit events
     if (!socket.userId || socket.userId !== hitterId) {
       socket.emit('error', { message: 'Unauthorized: hitter mismatch' });
       return;
     }
 
-    // Validate damage bounds
     if (typeof damage !== 'number' || damage <= 0 || damage > 1000) {
       socket.emit('error', { message: 'Invalid damage value' });
       return;
     }
 
     try {
-      // Verify both players are active participants in this game
       const participants = await db('game_participants')
         .where('game_id', gameId)
         .whereIn('user_id', [hitterId, victimId])
@@ -882,9 +1111,61 @@ io.on('connection', (socket) => {
       console.error('game:hit error:', err);
     }
   });
-  
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
+
+  // ── Disconnect ─────────────────────────────────────────────────────────────
+  socket.on('disconnect', async () => {
+    if (!socket.userId) return;
+
+    console.log(`[Socket] User ${socket.userId} disconnected`);
+
+    try {
+      // Find any active game this user was in
+      const participant = await db('game_participants')
+        .join('games', 'games.id', 'game_participants.game_id')
+        .where('game_participants.user_id', socket.userId)
+        .where('games.status', 'playing')
+        .where('game_participants.status', 'active')
+        .select('game_participants.id', 'game_participants.game_id')
+        .first();
+
+      if (!participant) return;
+
+      await db('game_participants')
+        .where('id', participant.id)
+        .update({ status: 'disconnected', disconnected_at: new Date() });
+
+      io.to(`game:${participant.game_id}`).emit('player:disconnected', {
+        userId: socket.userId,
+        gameId: participant.game_id
+      });
+
+      // Eliminate after 60 seconds if not reconnected
+      const timerId = setTimeout(async () => {
+        try {
+          const updated = await db('game_participants')
+            .where('id', participant.id)
+            .where('status', 'disconnected') // only if still disconnected
+            .update({ status: 'eliminated', final_balance: 0, eliminated_at: new Date() });
+
+          if (updated > 0) {
+            io.to(`game:${participant.game_id}`).emit('player:eliminated', {
+              userId: socket.userId,
+              gameId: participant.game_id,
+              reason: 'disconnect_timeout'
+            });
+            console.log(`[Socket] User ${socket.userId} eliminated (disconnect timeout)`);
+          }
+        } catch (err) {
+          console.error('[Socket] Elimination timer error:', err.message);
+        } finally {
+          disconnectTimers.delete(socket.userId);
+        }
+      }, 60000);
+
+      disconnectTimers.set(socket.userId, timerId);
+    } catch (err) {
+      console.error('[Socket] Disconnect handler error:', err.message);
+    }
   });
 });
 
@@ -933,6 +1214,7 @@ function generateRoomCode() {
 const PORT = process.env.PORT || 3001;
 
 server.listen(PORT, () => {
+  startInvoiceSubscription();
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
 ║     ⚡ LIGHTNING ARENA SERVER v1.0.0 ⚡                   ║
@@ -946,7 +1228,78 @@ server.listen(PORT, () => {
   `);
 });
 
-// Graceful shutdown
+// =====================================================
+// LND INVOICE SUBSCRIPTION (real-time deposits)
+// =====================================================
+// Replaces unreliable client polling: any payment settled by LND is
+// credited immediately, even if no client is currently polling.
+
+function startInvoiceSubscription() {
+  if (!lnd) return;
+
+  console.log('[LND] Starting invoice subscription...');
+
+  const stream = lnd.subscribeInvoices();
+
+  stream.on('data', async (invoice) => {
+    if (!invoice.settled) return;
+
+    const paymentHash = Buffer.isBuffer(invoice.r_hash)
+      ? invoice.r_hash.toString('hex')
+      : invoice.r_hash;
+
+    try {
+      await db.transaction(async (trx) => {
+        // Atomic guard — same as polling endpoint, prevents double-credit
+        const updated = await trx('deposits')
+          .where('payment_hash', paymentHash)
+          .where('status', 'pending')
+          .update({
+            status: 'paid',
+            preimage: Buffer.isBuffer(invoice.r_preimage)
+              ? invoice.r_preimage.toString('hex')
+              : invoice.r_preimage,
+            paid_at: new Date()
+          });
+
+        if (updated === 0) return; // Already processed or unknown invoice
+
+        const deposit = await trx('deposits').where('payment_hash', paymentHash).first();
+
+        await trx('users')
+          .where('id', deposit.user_id)
+          .increment('escrow_balance_sats', deposit.amount_sats)
+          .increment('escrow_total_deposited', deposit.amount_sats);
+
+        console.log(`[LND] Deposit confirmed: ${deposit.amount_sats} sats → user ${deposit.user_id}`);
+
+        // Notify user in real-time
+        io.to(`user:${deposit.user_id}`).emit('deposit:confirmed', {
+          paymentHash,
+          amountSats: deposit.amount_sats
+        });
+      });
+    } catch (err) {
+      console.error('[LND] Invoice processing error:', err.message);
+    }
+  });
+
+  stream.on('error', (err) => {
+    console.error('[LND] Invoice stream error:', err.message);
+    // Reconnect after 5 seconds
+    setTimeout(startInvoiceSubscription, 5000);
+  });
+
+  stream.on('end', () => {
+    console.warn('[LND] Invoice stream ended — reconnecting in 5s...');
+    setTimeout(startInvoiceSubscription, 5000);
+  });
+}
+
+// =====================================================
+// GRACEFUL SHUTDOWN
+// =====================================================
+
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down...');
   server.close(() => {
