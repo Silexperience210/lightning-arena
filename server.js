@@ -60,12 +60,14 @@ const redisClient = redis.createClient({
 });
 redisClient.connect().catch(console.error);
 
-// LND connection
-const lnd = createLightningClient({
-  server: process.env.LND_GRPC_HOST,
-  macaroonPath: process.env.LND_MACAROON_PATH,
-  tlsCertPath: process.env.LND_TLS_CERT_PATH
-});
+// LND connection — only initialize if explicitly enabled to avoid ENOENT crash in NWC-only mode
+const lnd = process.env.LND_ENABLED !== 'false'
+  ? createLightningClient({
+      server: process.env.LND_GRPC_HOST,
+      macaroonPath: process.env.LND_MACAROON_PATH,
+      tlsCertPath: process.env.LND_TLS_CERT_PATH
+    })
+  : null;
 
 // Payment Router initialization
 const paymentRouter = new PaymentRouter({
@@ -111,10 +113,20 @@ function authenticate(req, res, next) {
 }
 
 function requireGameHost(req, res, next) {
-  // Verify user is game host
   const { gameId } = req.params;
-  // Implementation depends on your game session logic
-  next();
+  const userId = req.user?.userId;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  db('games').where('id', gameId).first()
+    .then(game => {
+      if (!game) return res.status(404).json({ error: 'Game not found' });
+      if (game.host_id !== userId) return res.status(403).json({ error: 'Only the game host can perform this action' });
+      next();
+    })
+    .catch(err => {
+      console.error('requireGameHost error:', err);
+      res.status(500).json({ error: 'Authorization check failed' });
+    });
 }
 
 // =====================================================
@@ -175,9 +187,9 @@ app.post('/api/auth/login', async (req, res) => {
     let user;
     
     if (lnAuth) {
-      // LNURL-auth implementation
-      // Verify lnAuth signature
-      user = await db('users').where('ln_address', lnAuth.lnAddress).first();
+      // LNURL-auth requires cryptographic signature verification which is not yet implemented.
+      // Allowing login without signature verification would let anyone impersonate any user.
+      return res.status(501).json({ error: 'LNURL-auth is not yet implemented. Please use password authentication.' });
     } else {
       // Password auth
       user = await db('users').where('username', username).first();
@@ -396,7 +408,11 @@ app.get('/api/wallet/balance', authenticate, async (req, res) => {
 app.post('/api/wallet/deposit', authenticate, async (req, res) => {
   const { amountSats, gameId } = req.body;
   const userId = req.user.userId;
-  
+
+  if (!lnd) {
+    return res.status(503).json({ error: 'Deposits via Lightning are not available in NWC-only mode' });
+  }
+
   try {
     // Create LND invoice
     const invoice = await lnd.addInvoice({
@@ -432,37 +448,50 @@ app.post('/api/wallet/deposit', authenticate, async (req, res) => {
 // Check deposit status
 app.get('/api/wallet/deposit/:paymentHash', authenticate, async (req, res) => {
   const { paymentHash } = req.params;
-  
+
+  if (!lnd) {
+    return res.status(503).json({ error: 'LND not available' });
+  }
+
   try {
     const deposit = await db('deposits')
       .where('payment_hash', paymentHash)
       .first();
-    
+
     if (!deposit) return res.status(404).json({ error: 'Deposit not found' });
+
+    // IDOR guard: users can only check their own deposits
+    if (deposit.user_id !== req.user.userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
     
     // Check LND if still pending
     if (deposit.status === 'pending') {
       const lookup = await lnd.lookupInvoice({ r_hash_str: paymentHash });
       
       if (lookup.settled) {
-        // Payment received!
+        // Payment received — use atomic update to prevent double-crediting on concurrent requests
         await db.transaction(async (trx) => {
-          // Update deposit
-          await trx('deposits')
+          const updated = await trx('deposits')
             .where('id', deposit.id)
+            .where('status', 'pending') // atomic guard: only one concurrent winner
             .update({
               status: 'paid',
               preimage: lookup.r_preimage.toString('hex'),
               paid_at: new Date()
             });
-          
-          // Credit user
+
+          if (updated === 0) {
+            // Another concurrent request already processed this deposit
+            return;
+          }
+
           await trx('users')
             .where('id', deposit.user_id)
             .increment('escrow_balance_sats', deposit.amount_sats)
             .increment('escrow_total_deposited', deposit.amount_sats);
         });
-        
+
         deposit.status = 'paid';
         
         // Notify user via WebSocket
@@ -489,18 +518,18 @@ app.post('/api/wallet/withdraw', authenticate, async (req, res) => {
   const userId = req.user.userId;
   
   try {
-    const user = await db('users').where('id', userId).first();
-    
-    // Check balance
-    if (user.escrow_balance_sats < amountSats) {
+    // Atomic check + deduction in a single UPDATE to prevent concurrent double-withdrawal
+    const updated = await db('users')
+      .where('id', userId)
+      .where('escrow_balance_sats', '>=', amountSats)
+      .update({
+        escrow_balance_sats: db.raw('escrow_balance_sats - ?', [amountSats]),
+        escrow_locked_sats: db.raw('escrow_locked_sats + ?', [amountSats])
+      });
+
+    if (updated === 0) {
       return res.status(400).json({ error: 'Insufficient balance' });
     }
-    
-    // Lock balance
-    await db('users').where('id', userId).update({
-      escrow_balance_sats: user.escrow_balance_sats - amountSats,
-      escrow_locked_sats: user.escrow_locked_sats + amountSats
-    });
     
     // Create withdrawal record
     const [withdrawal] = await db('withdrawals').insert({
@@ -529,25 +558,30 @@ async function processWithdrawal(withdrawalId) {
   try {
     const withdrawal = await db('withdrawals').where('id', withdrawalId).first();
     if (!withdrawal) return;
-    
+
+    // Guard: LND required to send payments
+    if (!lnd) {
+      throw new Error('LND not available — cannot process withdrawal');
+    }
+
     // Update status
     await db('withdrawals').where('id', withdrawalId).update({ status: 'processing' });
-    
+
     // Resolve LN address to invoice
     // This is simplified - real implementation needs LNURL-pay resolution
     const [username, domain] = withdrawal.destination_ln_address.split('@');
-    
+
     // Fetch LNURL-pay endpoint
     const lnurlResponse = await fetch(`https://${domain}/.well-known/lnurlp/${username}`);
     const lnurlData = await lnurlResponse.json();
-    
+
     // Request invoice
     const callbackUrl = new URL(lnurlData.callback);
     callbackUrl.searchParams.set('amount', withdrawal.amount_sats * 1000);
-    
+
     const invoiceResponse = await fetch(callbackUrl.toString());
     const invoiceData = await invoiceResponse.json();
-    
+
     // Pay via LND
     const payment = await lnd.sendPaymentSync({
       payment_request: invoiceData.pr,
@@ -642,37 +676,41 @@ app.post('/api/games', authenticate, async (req, res) => {
 app.post('/api/games/:roomCode/join', authenticate, async (req, res) => {
   const { roomCode } = req.params;
   const userId = req.user.userId;
-  const user = await db('users').where('id', userId).first();
-  
+
   try {
-    const game = await db('games').where('room_code', roomCode).first();
+    const [user, game] = await Promise.all([
+      db('users').where('id', userId).first(),
+      db('games').where('room_code', roomCode).first()
+    ]);
+
     if (!game) return res.status(404).json({ error: 'Game not found' });
     if (game.status !== 'lobby') return res.status(400).json({ error: 'Game already started' });
-    
+
     // Check if already joined
     const existing = await db('game_participants')
       .where({ game_id: game.id, user_id: userId })
       .first();
-    
+
     if (existing) {
       return res.json({ message: 'Already joined', participantId: existing.id });
     }
-    
-    // Check balance (escrow mode check)
+
+    // Lock buy-in atomically (same pattern as withdrawal to prevent double-join race condition)
     if (user.wallet_type === 'escrow') {
-      if (user.escrow_balance_sats < game.buy_in_sats) {
-        return res.status(400).json({ 
+      const locked = await db('users')
+        .where('id', userId)
+        .where('escrow_balance_sats', '>=', game.buy_in_sats)
+        .update({
+          escrow_balance_sats: db.raw('escrow_balance_sats - ?', [game.buy_in_sats]),
+          escrow_locked_sats: db.raw('escrow_locked_sats + ?', [game.buy_in_sats])
+        });
+
+      if (locked === 0) {
+        return res.status(400).json({
           error: 'Insufficient balance',
-          requiredSats: game.buy_in_sats,
-          currentSats: user.escrow_balance_sats
+          requiredSats: game.buy_in_sats
         });
       }
-      
-      // Lock buy-in amount
-      await db('users').where('id', userId).update({
-        escrow_balance_sats: user.escrow_balance_sats - game.buy_in_sats,
-        escrow_locked_sats: user.escrow_locked_sats + game.buy_in_sats
-      });
     }
     
     // Add participant
@@ -715,7 +753,12 @@ app.post('/api/games/:roomCode/join', authenticate, async (req, res) => {
 // Execute payment (called by game server)
 app.post('/api/payments/execute', authenticate, async (req, res) => {
   const { gameId, fromUserId, toUserId, amount, weapon, reason } = req.body;
-  
+
+  // Authorization: only the payer themselves can trigger a payment from their account
+  if (parseInt(fromUserId) !== req.user.userId) {
+    return res.status(403).json({ error: 'Cannot initiate payment on behalf of another user' });
+  }
+
   try {
     const result = await paymentRouter.executeTransfer({
       gameId,
@@ -775,25 +818,69 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Join game room
-  socket.on('game:join', (gameId) => {
-    socket.join(`game:${gameId}`);
-    console.log(`Socket ${socket.id} joined game ${gameId}`);
+  // Join game room — requires authenticated socket + active participation
+  socket.on('game:join', async (gameId) => {
+    if (!socket.userId) {
+      socket.emit('error', { message: 'Authentication required before joining a game room' });
+      return;
+    }
+
+    try {
+      const participant = await db('game_participants')
+        .where({ game_id: gameId, user_id: socket.userId })
+        .first();
+
+      if (!participant) {
+        socket.emit('error', { message: 'You are not a participant of this game' });
+        return;
+      }
+
+      socket.join(`game:${gameId}`);
+      console.log(`Socket ${socket.id} (user ${socket.userId}) joined game ${gameId}`);
+    } catch (err) {
+      console.error('game:join socket error:', err);
+    }
   });
   
   // Handle game events
   socket.on('game:hit', async (data) => {
-    // Validate and broadcast
     const { gameId, victimId, hitterId, weapon, damage } = data;
-    
-    // Broadcast to all in game room
-    io.to(`game:${gameId}`).emit('game:hit', {
-      victimId,
-      hitterId,
-      weapon,
-      damage,
-      timestamp: Date.now()
-    });
+
+    // Only the authenticated hitter can emit their own hit events
+    if (!socket.userId || socket.userId !== hitterId) {
+      socket.emit('error', { message: 'Unauthorized: hitter mismatch' });
+      return;
+    }
+
+    // Validate damage bounds
+    if (typeof damage !== 'number' || damage <= 0 || damage > 1000) {
+      socket.emit('error', { message: 'Invalid damage value' });
+      return;
+    }
+
+    try {
+      // Verify both players are active participants in this game
+      const participants = await db('game_participants')
+        .where('game_id', gameId)
+        .whereIn('user_id', [hitterId, victimId])
+        .where('status', 'active')
+        .select('user_id');
+
+      if (participants.length < 2) {
+        socket.emit('error', { message: 'Invalid game participants' });
+        return;
+      }
+
+      io.to(`game:${gameId}`).emit('game:hit', {
+        victimId,
+        hitterId,
+        weapon,
+        damage,
+        timestamp: Date.now()
+      });
+    } catch (err) {
+      console.error('game:hit error:', err);
+    }
   });
   
   socket.on('disconnect', () => {
@@ -835,11 +922,8 @@ app.get('/api/stats', async (req, res) => {
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No 0, O, 1, I
-  let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return code;
+  const bytes = require('crypto').randomBytes(6);
+  return Array.from(bytes).map(b => chars[b % chars.length]).join('');
 }
 
 // =====================================================

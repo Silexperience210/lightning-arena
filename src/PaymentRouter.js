@@ -145,12 +145,15 @@ class PaymentRouter extends EventEmitter {
     } catch (error) {
       console.error(`[PaymentRouter] Transfer failed:`, error);
       await this.markTransferFailed(transferId, error.message);
-      
-      if (route.type.startsWith('NWC') || route.type.startsWith('HYBRID')) {
-        console.log(`[Fallback] Attempting escrow fallback`);
+
+      // Only fall back to escrow for NWC_P2P failures (e.g. budget exceeded, network error).
+      // NEVER fall back for HYBRID routes: the payer's real wallet was not debited,
+      // so crediting the receiver from the escrow ledger would create sats from thin air.
+      if (route.type === 'NWC_P2P') {
+        console.log(`[Fallback] NWC P2P failed, attempting escrow fallback`);
         return this.executeEscrowFallback(transferId, fromUserId, toUserId, amount);
       }
-      
+
       throw error;
     }
   }
@@ -224,16 +227,16 @@ class PaymentRouter extends EventEmitter {
   
   async executeEscrowInternal(transferId, fromUserId, toUserId, amount) {
     await this.db.transaction(async (trx) => {
-      const fromBalance = await trx('users')
+      // Atomic deduction: only succeeds if balance is sufficient, preventing race conditions
+      const deducted = await trx('users')
         .where('id', fromUserId)
-        .select('escrow_balance_sats')
-        .first();
-      
-      if (fromBalance.escrow_balance_sats < amount) {
+        .where('escrow_balance_sats', '>=', amount)
+        .decrement('escrow_balance_sats', amount);
+
+      if (deducted === 0) {
         throw new Error('Insufficient escrow balance');
       }
-      
-      await trx('users').where('id', fromUserId).decrement('escrow_balance_sats', amount);
+
       await trx('users').where('id', toUserId).increment('escrow_balance_sats', amount);
       await trx('transfers').where('id', transferId).update({
         status: 'completed',
@@ -272,16 +275,17 @@ class PaymentRouter extends EventEmitter {
     });
     
     if (!payment.preimage) throw new Error('Hybrid payment failed');
-    
-    // Crédite escrow
-    await this.db('users').where('id', toUserId).increment('escrow_balance_sats', amount);
-    
-    await this.db('transfers').where('id', transferId).update({
-      status: 'completed',
-      preimage: payment.preimage,
-      completed_at: new Date()
+
+    // Credit receiver and mark transfer complete atomically
+    await this.db.transaction(async (trx) => {
+      await trx('users').where('id', toUserId).increment('escrow_balance_sats', amount);
+      await trx('transfers').where('id', transferId).update({
+        status: 'completed',
+        preimage: payment.preimage,
+        completed_at: new Date()
+      });
     });
-    
+
     return {
       tx: payment.preimage,
       mode: 'hybrid_nwc_to_escrow'
@@ -292,42 +296,53 @@ class PaymentRouter extends EventEmitter {
     if (!this.lndEnabled) {
       throw new Error('Hybrid mode requires LND');
     }
-    
+
     const toUser = await this.getUserWithDecryptedNWC(toUserId);
     const fromUser = await this.db('users').where('id', fromUserId).first();
-    
-    if (fromUser.escrow_balance_sats < amount) {
+
+    // Atomically reserve the balance BEFORE sending — deduct now, refund if LND fails.
+    // This prevents a race condition where two concurrent transfers both pass the balance check.
+    const reserved = await this.db('users')
+      .where('id', fromUserId)
+      .where('escrow_balance_sats', '>=', amount)
+      .decrement('escrow_balance_sats', amount);
+
+    if (reserved === 0) {
       throw new Error('Insufficient escrow balance');
     }
-    
-    // Invoice NWC du receiver
-    const toNWC = this.getNWCClient(toUser.nwc_uri_decrypted);
-    const invoiceResult = await toNWC.makeInvoice({
-      amount: amount * 1000,
-      description: description || `Payment from ${fromUser.username}`,
-      expiry: 120
-    });
-    
-    // LND paie
-    const payment = await this.lnd.sendPaymentSync({
-      payment_request: invoiceResult.invoice,
-      timeout_seconds: 60
-    });
-    
-    if (payment.payment_error) throw new Error(payment.payment_error);
-    
-    await this.db('users').where('id', fromUserId).decrement('escrow_balance_sats', amount);
-    
-    await this.db('transfers').where('id', transferId).update({
-      status: 'completed',
-      preimage: payment.payment_preimage.toString('hex'),
-      completed_at: new Date()
-    });
-    
-    return {
-      tx: payment.payment_preimage.toString('hex'),
-      mode: 'hybrid_escrow_to_nwc'
-    };
+
+    try {
+      // Invoice NWC du receiver
+      const toNWC = this.getNWCClient(toUser.nwc_uri_decrypted);
+      const invoiceResult = await toNWC.makeInvoice({
+        amount: amount * 1000,
+        description: description || `Payment from ${fromUser.username}`,
+        expiry: 120
+      });
+
+      // LND paie
+      const payment = await this.lnd.sendPaymentSync({
+        payment_request: invoiceResult.invoice,
+        timeout_seconds: 60
+      });
+
+      if (payment.payment_error) throw new Error(payment.payment_error);
+
+      await this.db('transfers').where('id', transferId).update({
+        status: 'completed',
+        preimage: payment.payment_preimage.toString('hex'),
+        completed_at: new Date()
+      });
+
+      return {
+        tx: payment.payment_preimage.toString('hex'),
+        mode: 'hybrid_escrow_to_nwc'
+      };
+    } catch (err) {
+      // LND payment failed — refund the reserved balance
+      await this.db('users').where('id', fromUserId).increment('escrow_balance_sats', amount);
+      throw err;
+    }
   }
 
   // =====================================================
@@ -454,6 +469,42 @@ class PaymentRouter extends EventEmitter {
       });
   }
   
+  // Retry an existing transfer record without creating a new one.
+  // executeTransfer() always creates a new record, so retrying via it causes infinite accumulation.
+  async retryExistingTransfer(transfer) {
+    const route = await this.determineOptimalRoute(transfer.from_user_id, transfer.to_user_id);
+    try {
+      let result;
+      switch (route.type) {
+        case 'NWC_P2P':
+          result = await this.executeNWCP2P(transfer.id, transfer.from_user_id, transfer.to_user_id, transfer.amount_sats, transfer.reason);
+          break;
+        case 'ESCROW_INTERNAL':
+          result = await this.executeEscrowInternal(transfer.id, transfer.from_user_id, transfer.to_user_id, transfer.amount_sats);
+          break;
+        case 'HYBRID_NWC_TO_ESCROW':
+          result = await this.executeHybridNWCToEscrow(transfer.id, transfer.from_user_id, transfer.to_user_id, transfer.amount_sats, transfer.reason);
+          break;
+        case 'HYBRID_ESCROW_TO_NWC':
+          result = await this.executeHybridEscrowToNWC(transfer.id, transfer.from_user_id, transfer.to_user_id, transfer.amount_sats, transfer.reason);
+          break;
+        default:
+          throw new Error(`Unknown route type: ${route.type}`);
+      }
+      this.emit('transferCompleted', {
+        transferId: transfer.id,
+        gameId: transfer.game_id,
+        from: transfer.from_user_id,
+        to: transfer.to_user_id,
+        amount: transfer.amount_sats,
+        mode: route.type,
+        tx: result.tx
+      });
+    } catch (err) {
+      await this.markTransferFailed(transfer.id, err.message);
+    }
+  }
+
   startRetryWorker() {
     setInterval(async () => {
       try {
@@ -462,17 +513,10 @@ class PaymentRouter extends EventEmitter {
           .where('retry_count', '<', this.config.maxRetries)
           .where('expires_at', '>', new Date())
           .select('*');
-        
+
         for (const transfer of pending) {
           try {
-            await this.executeTransfer({
-              gameId: transfer.game_id,
-              fromUserId: transfer.from_user_id,
-              toUserId: transfer.to_user_id,
-              amount: transfer.amount_sats,
-              weapon: transfer.weapon_type,
-              reason: 'Retry'
-            });
+            await this.retryExistingTransfer(transfer);
           } catch (retryErr) {
             console.error(`[RetryWorker] Failed:`, retryErr.message);
           }
