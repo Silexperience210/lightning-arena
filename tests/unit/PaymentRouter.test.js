@@ -617,3 +617,413 @@ describe('mapRouteToPaymentMode', () => {
     expect(router.mapRouteToPaymentMode('MYSTERY')).toBe('unknown');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUITE 8: executeNWCP2P
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('executeNWCP2P', () => {
+  const TRANSFER_ID = 'transfer-nwc-1';
+  const FROM        = 'user-nwc-a';
+  const TO          = 'user-nwc-b';
+  const AMOUNT      = 500;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('succeeds: creates invoice, pays it, and marks transfer completed', async () => {
+    const { router } = makeRouter();
+
+    jest.spyOn(router, 'getUserWithDecryptedNWC')
+      .mockResolvedValueOnce(nwcUser({ id: FROM, username: 'alice' }))
+      .mockResolvedValueOnce(nwcUser({ id: TO, username: 'bob' }));
+
+    mockMakeInvoice.mockResolvedValue({ invoice: 'lnbc500test' });
+    mockPayInvoice.mockResolvedValue({ preimage: 'abc123preimage', payment_hash: 'hash123' });
+
+    const result = await router.executeNWCP2P(TRANSFER_ID, FROM, TO, AMOUNT, 'hit');
+
+    expect(result.mode).toBe('nwc_p2p');
+    expect(result.tx).toBe('abc123preimage');
+    expect(mockMakeInvoice).toHaveBeenCalledTimes(1);
+    expect(mockPayInvoice).toHaveBeenCalledTimes(1);
+  });
+
+  test('throws when payInvoice returns no preimage', async () => {
+    const { router } = makeRouter();
+
+    jest.spyOn(router, 'getUserWithDecryptedNWC')
+      .mockResolvedValueOnce(nwcUser({ id: FROM }))
+      .mockResolvedValueOnce(nwcUser({ id: TO }));
+
+    mockMakeInvoice.mockResolvedValue({ invoice: 'lnbc500test' });
+    mockPayInvoice.mockResolvedValue({ preimage: null }); // payment failed
+
+    await expect(
+      router.executeNWCP2P(TRANSFER_ID, FROM, TO, AMOUNT, 'hit')
+    ).rejects.toThrow('Payment failed');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUITE 9: executeHybridNWCToEscrow
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('executeHybridNWCToEscrow', () => {
+  const TRANSFER_ID = 'transfer-hybrid-nwc';
+  const FROM        = 'user-nwc';
+  const TO          = 'user-escrow';
+  const AMOUNT      = 1500;
+
+  const mockLnd = {
+    addInvoice:      jest.fn(),
+    sendPaymentSync: jest.fn()
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('succeeds: NWC pays LND invoice, credits receiver escrow', async () => {
+    const { router } = makeRouter({}, mockLnd);
+    router.lndEnabled = true;
+
+    jest.spyOn(router, 'getUserWithDecryptedNWC').mockResolvedValue(
+      nwcUser({ id: FROM, username: 'alice' })
+    );
+
+    mockLnd.addInvoice.mockResolvedValue({ payment_request: 'lnbc_server_invoice' });
+    mockPayInvoice.mockResolvedValue({ preimage: 'nwc_preimage_123' });
+
+    const result = await router.executeHybridNWCToEscrow(
+      TRANSFER_ID, FROM, TO, AMOUNT, 'hit'
+    );
+
+    expect(result.mode).toBe('hybrid_nwc_to_escrow');
+    expect(result.tx).toBe('nwc_preimage_123');
+    expect(mockLnd.addInvoice).toHaveBeenCalledTimes(1);
+    expect(mockPayInvoice).toHaveBeenCalledTimes(1);
+  });
+
+  test('throws when payment preimage is missing', async () => {
+    const { router } = makeRouter({}, mockLnd);
+    router.lndEnabled = true;
+
+    jest.spyOn(router, 'getUserWithDecryptedNWC').mockResolvedValue(
+      nwcUser({ id: FROM })
+    );
+
+    mockLnd.addInvoice.mockResolvedValue({ payment_request: 'lnbc_invoice' });
+    mockPayInvoice.mockResolvedValue({ preimage: null });
+
+    await expect(
+      router.executeHybridNWCToEscrow(TRANSFER_ID, FROM, TO, AMOUNT, 'hit')
+    ).rejects.toThrow('Hybrid payment failed');
+  });
+
+  test('throws when LND is disabled', async () => {
+    const { router } = makeRouter({}, null); // lnd = null → lndEnabled = false
+
+    await expect(
+      router.executeHybridNWCToEscrow(TRANSFER_ID, FROM, TO, AMOUNT, 'hit')
+    ).rejects.toThrow('Hybrid mode requires LND');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUITE 10: executeEscrowFallback — error path
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('executeEscrowFallback — error path', () => {
+  test('throws "Both NWC and escrow failed" when internal escrow also fails', async () => {
+    const { router } = makeRouter();
+
+    jest.spyOn(router, 'executeEscrowInternal').mockRejectedValue(
+      new Error('Escrow DB down')
+    );
+
+    await expect(
+      router.executeEscrowFallback('tx-fallback', 'user-a', 'user-b', 1000)
+    ).rejects.toThrow('Both NWC and escrow failed');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUITE 11: getNWCClient — cached connection
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('getNWCClient — caching', () => {
+  test('returns the same client instance on second call within 5 min', () => {
+    const { router } = makeRouter();
+    const uri    = 'nostr+walletconnect://test-uri-cache';
+    const first  = router.getNWCClient(uri);
+    const second = router.getNWCClient(uri);
+    expect(first).toBe(second); // same object reference from cache
+  });
+
+  test('creates a new client if URI is different', () => {
+    const { router } = makeRouter();
+    const a = router.getNWCClient('nostr+walletconnect://uri-a');
+    const b = router.getNWCClient('nostr+walletconnect://uri-b');
+    expect(a).not.toBe(b);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUITE 12: getUserWithDecryptedNWC — decrypt error path
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('getUserWithDecryptedNWC — decrypt failure', () => {
+  test('returns user with nwc_uri_decrypted = null when decryption fails', async () => {
+    const { router, db } = makeRouter();
+
+    const userWithBadEncryption = {
+      id: 'user-bad-nwc',
+      wallet_type: 'nwc',
+      nwc_uri_encrypted: 'badhex',
+      nwc_uri_iv:        'badhex',
+      nwc_uri_auth_tag:  'badhex'
+    };
+
+    db('users').first.mockResolvedValueOnce(userWithBadEncryption);
+
+    const result = await router.getUserWithDecryptedNWC('user-bad-nwc');
+
+    expect(result).not.toBeNull();
+    expect(result.nwc_uri_decrypted).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUITE 13: retryExistingTransfer
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('retryExistingTransfer', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('retries ESCROW_INTERNAL route and emits transferCompleted', async () => {
+    const { router } = makeRouter();
+    const transfer = {
+      id:          'tx-retry-1',
+      game_id:     'game-1',
+      from_user_id: 'user-a',
+      to_user_id:   'user-b',
+      amount_sats:  1000,
+      reason:       'retry'
+    };
+
+    jest.spyOn(router, 'determineOptimalRoute').mockResolvedValue({ type: 'ESCROW_INTERNAL' });
+    jest.spyOn(router, 'executeEscrowInternal').mockResolvedValue({ tx: 'tx-retry-1', mode: 'escrow_internal' });
+    const emitSpy = jest.spyOn(router, 'emit');
+
+    await router.retryExistingTransfer(transfer);
+
+    expect(router.executeEscrowInternal).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith('transferCompleted', expect.objectContaining({ amount: 1000 }));
+  });
+
+  test('marks transfer failed when retry throws', async () => {
+    const { router } = makeRouter();
+    const transfer = {
+      id: 'tx-retry-fail', game_id: 'g1',
+      from_user_id: 'a', to_user_id: 'b', amount_sats: 500, reason: ''
+    };
+
+    jest.spyOn(router, 'determineOptimalRoute').mockResolvedValue({ type: 'ESCROW_INTERNAL' });
+    jest.spyOn(router, 'executeEscrowInternal').mockRejectedValue(new Error('retry DB error'));
+    jest.spyOn(router, 'markTransferFailed').mockResolvedValue(undefined);
+
+    await router.retryExistingTransfer(transfer); // should NOT throw — error is swallowed
+
+    expect(router.markTransferFailed).toHaveBeenCalledWith('tx-retry-fail', 'retry DB error');
+  });
+
+  test('retries NWC_P2P route', async () => {
+    const { router } = makeRouter();
+    const transfer = {
+      id: 'tx-nwc-retry', game_id: 'g2',
+      from_user_id: 'a', to_user_id: 'b', amount_sats: 750, reason: 'hit'
+    };
+
+    jest.spyOn(router, 'determineOptimalRoute').mockResolvedValue({ type: 'NWC_P2P' });
+    jest.spyOn(router, 'executeNWCP2P').mockResolvedValue({ tx: 'preimage-x', mode: 'nwc_p2p' });
+
+    await router.retryExistingTransfer(transfer);
+
+    expect(router.executeNWCP2P).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUITE 14: executeTransfer — additional branches
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('executeTransfer — additional branches', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('routes to NWC_P2P for two NWC users (success, covers break)', async () => {
+    const { router } = makeRouter({
+      transfers: { returning: 'tx-nwc-1', update: 1 }
+    });
+
+    jest.spyOn(router, 'getUserWithDecryptedNWC')
+      .mockResolvedValueOnce(nwcUser({ id: 'a' }))
+      .mockResolvedValueOnce(nwcUser({ id: 'b' }));
+
+    jest.spyOn(router, 'executeNWCP2P').mockResolvedValue({
+      tx: 'nwc-tx-1', mode: 'nwc_p2p'
+    });
+
+    const result = await router.executeTransfer({
+      gameId: 'g1', fromUserId: 'a', toUserId: 'b', amount: 300
+    });
+
+    expect(result.success).toBe(true);
+    expect(router.executeNWCP2P).toHaveBeenCalledTimes(1);
+  });
+
+  test('routes to HYBRID_NWC_TO_ESCROW (success, covers break)', async () => {
+    const { router } = makeRouter({
+      transfers: { returning: 'tx-hybrid-1', update: 1 }
+    });
+
+    jest.spyOn(router, 'getUserWithDecryptedNWC')
+      .mockResolvedValueOnce(nwcUser({ id: 'a' }))
+      .mockResolvedValueOnce(escrowUser({ id: 'b' }));
+
+    jest.spyOn(router, 'executeHybridNWCToEscrow').mockResolvedValue({
+      tx: 'hybrid-nwc-1', mode: 'hybrid_nwc_to_escrow'
+    });
+
+    const result = await router.executeTransfer({
+      gameId: 'g1', fromUserId: 'a', toUserId: 'b', amount: 400
+    });
+
+    expect(result.success).toBe(true);
+    expect(router.executeHybridNWCToEscrow).toHaveBeenCalledTimes(1);
+  });
+
+  test('routes to HYBRID_ESCROW_TO_NWC (success, covers break)', async () => {
+    const { router } = makeRouter({
+      transfers: { returning: 'tx-hybrid-escrow-1', update: 1 }
+    });
+
+    jest.spyOn(router, 'getUserWithDecryptedNWC')
+      .mockResolvedValueOnce(escrowUser({ id: 'a' }))
+      .mockResolvedValueOnce(nwcUser({ id: 'b' }));
+
+    jest.spyOn(router, 'executeHybridEscrowToNWC').mockResolvedValue({
+      tx: 'hybrid-escrow-1', mode: 'hybrid_escrow_to_nwc'
+    });
+
+    const result = await router.executeTransfer({
+      gameId: 'g1', fromUserId: 'a', toUserId: 'b', amount: 350
+    });
+
+    expect(result.success).toBe(true);
+    expect(router.executeHybridEscrowToNWC).toHaveBeenCalledTimes(1);
+  });
+
+  test('throws for unknown route type (covers default: branch)', async () => {
+    const { router } = makeRouter({
+      transfers: { returning: 'tx-unknown-1', update: 1 }
+    });
+
+    jest.spyOn(router, 'determineOptimalRoute').mockResolvedValue({ type: 'UNKNOWN_ROUTE_TYPE' });
+    jest.spyOn(router, 'markTransferFailed').mockResolvedValue(undefined);
+
+    await expect(
+      router.executeTransfer({ gameId: 'g1', fromUserId: 'a', toUserId: 'b', amount: 100 })
+    ).rejects.toThrow('Unknown route type: UNKNOWN_ROUTE_TYPE');
+
+    expect(router.markTransferFailed).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUITE 15: executeEscrowFallback — success path
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('executeEscrowFallback — success path', () => {
+  test('returns success with escrow_fallback mode when escrow succeeds', async () => {
+    const { router } = makeRouter();
+
+    jest.spyOn(router, 'executeEscrowInternal').mockResolvedValue({
+      tx: 'fallback-tx-1', mode: 'escrow_internal'
+    });
+
+    const result = await router.executeEscrowFallback('tx-fb', 'user-a', 'user-b', 500);
+
+    expect(result.success).toBe(true);
+    expect(result.mode).toBe('escrow_fallback');
+    expect(result.fallback).toBe(true);
+    expect(router.executeEscrowInternal).toHaveBeenCalledWith('tx-fb', 'user-a', 'user-b', 500);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUITE 16: retryExistingTransfer — unknown route type
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('retryExistingTransfer — HYBRID routes and unknown type', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('retries HYBRID_NWC_TO_ESCROW route (covers case branch)', async () => {
+    const { router } = makeRouter();
+    const transfer = {
+      id: 'tx-hybrid-nwc-retry', game_id: 'g4',
+      from_user_id: 'a', to_user_id: 'b', amount_sats: 600, reason: 'hit'
+    };
+
+    jest.spyOn(router, 'determineOptimalRoute').mockResolvedValue({ type: 'HYBRID_NWC_TO_ESCROW' });
+    jest.spyOn(router, 'executeHybridNWCToEscrow').mockResolvedValue({ tx: 'hybrid-tx-1', mode: 'hybrid_nwc_to_escrow' });
+    const emitSpy = jest.spyOn(router, 'emit');
+
+    await router.retryExistingTransfer(transfer);
+
+    expect(router.executeHybridNWCToEscrow).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith('transferCompleted', expect.objectContaining({ amount: 600 }));
+  });
+
+  test('retries HYBRID_ESCROW_TO_NWC route (covers case branch)', async () => {
+    const { router } = makeRouter();
+    const transfer = {
+      id: 'tx-hybrid-escrow-retry', game_id: 'g5',
+      from_user_id: 'a', to_user_id: 'b', amount_sats: 700, reason: 'hit'
+    };
+
+    jest.spyOn(router, 'determineOptimalRoute').mockResolvedValue({ type: 'HYBRID_ESCROW_TO_NWC' });
+    jest.spyOn(router, 'executeHybridEscrowToNWC').mockResolvedValue({ tx: 'hybrid-tx-2', mode: 'hybrid_escrow_to_nwc' });
+    const emitSpy = jest.spyOn(router, 'emit');
+
+    await router.retryExistingTransfer(transfer);
+
+    expect(router.executeHybridEscrowToNWC).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith('transferCompleted', expect.objectContaining({ amount: 700 }));
+  });
+
+  test('marks transfer failed for unrecognized route type (covers default: branch)', async () => {
+    const { router } = makeRouter();
+    const transfer = {
+      id: 'tx-unknown-retry', game_id: 'g6',
+      from_user_id: 'a', to_user_id: 'b', amount_sats: 200, reason: ''
+    };
+
+    jest.spyOn(router, 'determineOptimalRoute').mockResolvedValue({ type: 'UNKNOWN_ROUTE_TYPE' });
+    jest.spyOn(router, 'markTransferFailed').mockResolvedValue(undefined);
+
+    await router.retryExistingTransfer(transfer); // should NOT throw — error is swallowed
+
+    expect(router.markTransferFailed).toHaveBeenCalledWith(
+      'tx-unknown-retry',
+      'Unknown route type: UNKNOWN_ROUTE_TYPE'
+    );
+  });
+});

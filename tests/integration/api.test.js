@@ -264,13 +264,13 @@ describe('POST /api/auth/login', () => {
     expect(res.status).toBe(401);
   });
 
-  test('501 — lnAuth is not yet implemented', async () => {
+  test('400 — lnAuth missing required fields (k1, key)', async () => {
     const res = await request(app)
       .post('/api/auth/login')
-      .send({ lnAuth: { sig: 'abc' } });
+      .send({ lnAuth: { sig: 'abc' } }); // missing k1 and key
 
-    expect(res.status).toBe(501);
-    expect(res.body.error).toMatch(/not yet implemented/i);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/k1.*sig.*key|requires/i);
   });
 });
 

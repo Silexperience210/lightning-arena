@@ -1,0 +1,198 @@
+.game-screen {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 16px;
+  min-height: 100vh;
+}
+
+.game-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid #3a3a6a;
+  padding-bottom: 12px;
+  margin-bottom: 20px;
+}
+
+.game-title {
+  color: #f7931a;
+  font-size: 18px;
+}
+
+.game-status {
+  font-size: 12px;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.btn-leave {
+  background: #2a1010;
+  color: #f88;
+  border: 1px solid #f44;
+  border-radius: 4px;
+  padding: 8px 14px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.hud-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+@media (max-width: 600px) {
+  .hud-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.panel {
+  background: #10102a;
+  border: 1px solid #3a3a6a;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.panel-title {
+  font-size: 11px;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 12px;
+}
+
+/* Player list */
+.player-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid #1a1a3a;
+}
+
+.player-item:last-child {
+  border-bottom: none;
+}
+
+.player-name {
+  font-size: 14px;
+  color: #e0e0ff;
+}
+
+.player-name.me {
+  color: #f7931a;
+}
+
+.player-balance {
+  font-size: 13px;
+  color: #f7931a;
+}
+
+.player-status {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 20px;
+}
+
+.player-status.active    { background: #103010; color: #8f8; }
+.player-status.disconnected { background: #302010; color: #fa0; }
+.player-status.eliminated { background: #301010; color: #f88; }
+.player-status.winner    { background: #1a3010; color: #8f8; }
+
+/* Hit controls */
+.target-select {
+  margin-bottom: 12px;
+}
+
+.btn-hit {
+  background: linear-gradient(135deg, #f7931a, #e07010);
+  color: #000;
+  font-weight: bold;
+  font-size: 16px;
+  padding: 14px;
+  width: 100%;
+  border-radius: 6px;
+  cursor: pointer;
+  border: none;
+  margin-top: 8px;
+  transition: transform 0.1s;
+}
+
+.btn-hit:active {
+  transform: scale(0.97);
+}
+
+.btn-hit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Flash animation for incoming hit */
+@keyframes flash-red {
+  0%   { background: #3a0000; }
+  50%  { background: #200010; }
+  100% { background: #10102a; }
+}
+
+.panel.hit-received {
+  animation: flash-red 0.4s ease-out;
+}
+
+/* Event log */
+.event-log {
+  max-height: 220px;
+  overflow-y: auto;
+  font-size: 12px;
+  color: #888;
+}
+
+.log-entry {
+  padding: 4px 0;
+  border-bottom: 1px solid #1a1a2e;
+}
+
+.log-entry .highlight { color: #f7931a; }
+.log-entry .damage    { color: #f88; }
+.log-entry .joined    { color: #8f8; }
+.log-entry .payment   { color: #8af; }
+
+/* Overlay states */
+.game-ended-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.85);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.result-card {
+  background: #10102a;
+  border: 2px solid #f7931a;
+  border-radius: 12px;
+  padding: 40px;
+  text-align: center;
+  max-width: 360px;
+}
+
+.result-card.winner { border-color: #f7931a; }
+.result-card.loser  { border-color: #f44; }
+
+.result-icon { font-size: 48px; margin-bottom: 12px; }
+.result-title { font-size: 24px; font-weight: bold; margin-bottom: 8px; }
+.result-payout { font-size: 18px; color: #f7931a; margin-bottom: 20px; }
+
+.btn-back {
+  background: #f7931a;
+  color: #000;
+  font-weight: bold;
+  padding: 12px 32px;
+  border-radius: 6px;
+  border: none;
+  font-size: 15px;
+  cursor: pointer;
+}

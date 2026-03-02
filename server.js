@@ -187,9 +187,54 @@ app.post('/api/auth/login', async (req, res) => {
     let user;
     
     if (lnAuth) {
-      // LNURL-auth requires cryptographic signature verification which is not yet implemented.
-      // Allowing login without signature verification would let anyone impersonate any user.
-      return res.status(501).json({ error: 'LNURL-auth is not yet implemented. Please use password authentication.' });
+      // LNURL-auth: secp256k1 signature verification (Node.js 18+ native support)
+      const { k1, sig, key } = lnAuth;
+      if (!k1 || !sig || !key) {
+        return res.status(400).json({ error: 'LNURL-auth requires k1, sig, and key fields' });
+      }
+
+      // Verify secp256k1 DER signature over k1
+      // key: hex-encoded 33-byte compressed public key
+      // sig: hex-encoded DER-encoded signature
+      let valid = false;
+      try {
+        const crypto = require('crypto');
+        // Wrap compressed public key in SubjectPublicKeyInfo DER envelope (secp256k1 OID 1.3.132.0.10)
+        const secp256k1Prefix = Buffer.from(
+          '3036301006072a8648ce3d020106052b8104000a032200', 'hex'
+        );
+        const rawKey = Buffer.from(key, 'hex');
+        if (rawKey.length !== 33) {
+          return res.status(400).json({ error: 'Invalid public key length' });
+        }
+        const spkiKey = Buffer.concat([secp256k1Prefix, rawKey]);
+        const verify = crypto.createVerify('SHA256');
+        verify.update(Buffer.from(k1, 'hex'));
+        valid = verify.verify(
+          { key: spkiKey, format: 'der', type: 'spki' },
+          Buffer.from(sig, 'hex')
+        );
+      } catch (cryptoErr) {
+        return res.status(400).json({ error: 'Signature verification failed', details: cryptoErr.message });
+      }
+
+      if (!valid) {
+        return res.status(401).json({ error: 'Invalid LNURL-auth signature' });
+      }
+
+      // Find or create user by lnurl_pubkey
+      user = await db('users').where('lnurl_pubkey', key).first();
+      if (!user) {
+        // Auto-register LNURL-auth user
+        const [newUser] = await db('users').insert({
+          username: `lnauth_${key.slice(0, 12)}`,
+          lnurl_pubkey: key,
+          wallet_type: 'escrow',
+          escrow_balance_sats: 0,
+          created_at: new Date()
+        }).returning(['id', 'username', 'ln_address', 'wallet_type', 'escrow_balance_sats']);
+        user = newUser;
+      }
     } else {
       // Password auth
       user = await db('users').where('username', username).first();
@@ -573,11 +618,30 @@ async function processWithdrawal(withdrawalId) {
 
     // Fetch LNURL-pay endpoint
     const lnurlResponse = await fetch(`https://${domain}/.well-known/lnurlp/${username}`);
+    if (!lnurlResponse.ok) {
+      throw new Error(`LNURL-pay endpoint returned HTTP ${lnurlResponse.status}`);
+    }
     const lnurlData = await lnurlResponse.json();
+
+    // Validate LNURL-pay response
+    if (lnurlData.tag !== 'payRequest') {
+      throw new Error(`Expected payRequest tag, got: ${lnurlData.tag}`);
+    }
+    if (!lnurlData.callback || !lnurlData.minSendable || !lnurlData.maxSendable) {
+      throw new Error('LNURL-pay response missing required fields (callback, minSendable, maxSendable)');
+    }
+
+    // Validate amount bounds
+    const amountMsats = withdrawal.amount_sats * 1000;
+    if (amountMsats < lnurlData.minSendable || amountMsats > lnurlData.maxSendable) {
+      throw new Error(
+        `Amount ${amountMsats} msats out of range [${lnurlData.minSendable}, ${lnurlData.maxSendable}]`
+      );
+    }
 
     // Request invoice
     const callbackUrl = new URL(lnurlData.callback);
-    callbackUrl.searchParams.set('amount', withdrawal.amount_sats * 1000);
+    callbackUrl.searchParams.set('amount', amountMsats);
 
     const invoiceResponse = await fetch(callbackUrl.toString());
     const invoiceData = await invoiceResponse.json();
@@ -669,6 +733,20 @@ app.post('/api/games', authenticate, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to create game' });
+  }
+});
+
+// List lobby games
+app.get('/api/games', authenticate, async (req, res) => {
+  try {
+    const games = await db('games')
+      .where('status', 'lobby')
+      .orderBy('created_at', 'desc')
+      .limit(20)
+      .select('id', 'room_code', 'host_id', 'game_mode', 'buy_in_sats', 'max_players', 'total_pot_sats', 'created_at');
+    res.json(games);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to list games' });
   }
 });
 
@@ -1311,6 +1389,6 @@ process.on('SIGTERM', async () => {
   });
 });
 
-// Export app for integration testing (supertest).
+// Export app, server and io for integration testing (supertest + socket.io-client).
 // Guard server.listen so it only runs when executed directly, not when imported.
-module.exports = { app, db };
+module.exports = { app, db, server, io };
