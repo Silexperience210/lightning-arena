@@ -931,7 +931,8 @@ app.post('/api/payments/execute', authenticate, async (req, res) => {
   const { gameId, fromUserId, toUserId, amount, weapon, reason } = req.body;
 
   // Authorization: only the payer themselves can trigger a payment from their account
-  if (parseInt(fromUserId) !== req.user.userId) {
+  // Note: UUIDs are strings — parseInt() would return NaN for all UUIDs, breaking the check.
+  if (fromUserId !== req.user.userId) {
     return res.status(403).json({ error: 'Cannot initiate payment on behalf of another user' });
   }
 
@@ -1213,9 +1214,10 @@ function generateRoomCode() {
 
 const PORT = process.env.PORT || 3001;
 
-server.listen(PORT, () => {
-  startInvoiceSubscription();
-  console.log(`
+if (require.main === module) {
+  server.listen(PORT, () => {
+    startInvoiceSubscription();
+    console.log(`
 ╔══════════════════════════════════════════════════════════╗
 ║     ⚡ LIGHTNING ARENA SERVER v1.0.0 ⚡                   ║
 ║     Hybrid NWC + Escrow Payment Infrastructure           ║
@@ -1225,8 +1227,9 @@ server.listen(PORT, () => {
 ║  Redis:       ${(process.env.REDIS_URL || 'localhost:6379').padEnd(44)} ║
 ║  LND:         ${(process.env.LND_GRPC_HOST || 'Not configured').padEnd(44)} ║
 ╚══════════════════════════════════════════════════════════╝
-  `);
-});
+    `);
+  });
+}
 
 // =====================================================
 // LND INVOICE SUBSCRIPTION (real-time deposits)
@@ -1307,3 +1310,7 @@ process.on('SIGTERM', async () => {
     process.exit(0);
   });
 });
+
+// Export app for integration testing (supertest).
+// Guard server.listen so it only runs when executed directly, not when imported.
+module.exports = { app, db };
